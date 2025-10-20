@@ -1,0 +1,57 @@
+-- Query base + filtros simples diretamente no SQL
+select 
+  codigo as ID,
+  replace(replace(numero_precatorio,'(',''),')','') as title,
+  format(replace(replace(cpf_informado,'-',''),'.',''),'00000000000') as cpf_informado,
+  format(replace(replace(cpf_original,'-',''),'.',''),'00000000000') as cpf_original,
+  fase_atual,
+  criador,
+  responsaveis,
+  criado_em,
+  oferta_maxima,
+  motivo_de_perda_restored,
+  motivo_de_perda,
+  primeira_vez_que_entrou_na_fase_perdido,
+  ultima_vez_que_saiu_da_fase_precificacao,
+  primeira_vez_que_entrou_na_fase_reataque,
+  canal,
+  parceiro,
+  valor_bruto_atualizado,
+  outros_descontos,
+  desconto_honorarios,
+  valor_liquido_a_receber,
+  data_estimada_de_recebimento,
+  oferta_minima,
+  herdeiro,
+  percentual_cedente,
+  nome_do_contato,
+  telefone_1,
+  ente_devedor
+from precatorio.esteira_precatorios
+where
+  -- 1) Só cards sem parceiro (já existia)
+  parceiro is null
+
+  -- 2) Fase atual não nula
+  and fase_atual is not null
+
+  -- 3) Canal diferente de 'Contato Ativo' e 'Indicação'
+  --    Observação: valores nulos passam (mesma lógica do pandas)
+  and (
+    canal is null
+    or lower(btrim(canal)) not in ('contato ativo', 'indicação', 'indicacao')
+  )
+
+  -- 4) Excluir fases específicas (com variantes simples com/sem acento)
+  and lower(btrim(fase_atual)) not in (
+    'perdido',
+    'finalizados',
+    'alçada tribunais', 'alcada tribunais',
+    'pool (loa)',
+    'opt-out',
+    'insucesso no contato',
+    'auxiliar',
+    'reataque',
+    'compra p2'
+  )
+;
