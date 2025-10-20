@@ -1,0 +1,67 @@
+// ===============================================================
+// CODE1 — Inserção linha a linha no banco (com existentes)
+// Une df_consolidado + df_existentes_padronizado
+// Converte codigo_agente para número ou NULL (evita erro de tipo)
+// ===============================================================
+
+// Helpers
+function toCodigoOrNull(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return /^\d+$/.test(s) ? Number(s) : null; // numérico => Number; senão => null
+}
+
+function toJSON(v) {
+  try { return JSON.stringify(v ?? []); } catch { return "[]"; }
+}
+
+// 1) Carrega dados novos (alocação atual)
+const dfNovo = Alocacao_agentes_comercial.data?.df_consolidado || [];
+
+// 2) Carrega cards já alocados (fases Novo Lead / Tentativa / Em negociação)
+const dfExist = Roteamento_dos_Grupos_Prontos.data?.df_existentes_padronizado || [];
+
+// 3) Concatena (se quiser, dá pra deduplicar por cpf_tratado)
+const dados = [...dfNovo, ...dfExist];
+
+if (!dados.length) {
+  console.warn("⚠️ Nenhum registro encontrado (df_consolidado + df_existentes_padronizado).");
+  return { total: 0, sucesso: 0, falhas: 0, erros: ['sem dados'] };
+}
+
+// Contadores
+let sucesso = 0;
+let falhas = 0;
+const erros = [];
+
+// Inserção linha a linha
+for (const r of dados) {
+  try {
+    await insert_linha_consolidado.trigger({
+      additionalScope: {
+        // ⚠️ IMPORTANTE: se a coluna no banco é INTEGER, passe número ou NULL
+        codigo_agente: toCodigoOrNull(r.codigo_agente),
+
+        // Nome do agente — para os existentes, já vem correto do Roteamento; para novos, vem do Alocacao
+        nome_agente: r.nome_agente ?? 'Não alocado',
+
+        cpf_tratado: r.cpf_tratado ?? '',
+        cards_ids_do_cpf: toJSON(r.cards_ids_do_cpf),
+        score_precatorio: String(r.score_precatorio ?? ''),
+        oferta_maxima: String(r.oferta_maxima ?? ''),
+        peso_ente: String(r.peso_ente ?? ''),
+        peso_data: String(r.peso_data ?? '')
+      }
+    });
+    sucesso++;
+  } catch (e) {
+    falhas++;
+    erros.push({
+      cpf: r.cpf_tratado ?? '',
+      erro: e?.message ?? String(e)
+    });
+  }
+}
+
+console.log(`✅ Inserção concluída. Sucesso: ${sucesso} / Falhas: ${falhas}`);
+return { total: dados.length, sucesso, falhas, erros };
