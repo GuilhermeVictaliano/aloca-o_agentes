@@ -1,0 +1,87 @@
+import pandas as pd
+
+# 1) ENTRADA: agora vem DIRETO da query do banco
+df = pd.DataFrame(query_geral.data)
+
+# 2) SANIDADE SIMPLES: alinhar nomes e checar colunas essenciais
+#    A query usa "ID" (maiúsculo). Padronizamos para "id" para facilitar.
+if "ID" in df.columns and "id" not in df.columns:
+    df = df.rename(columns={"ID": "id"})
+
+colunas_esperadas = ["id", "fase_atual", "responsaveis", "cpf_informado", "oferta_maxima","ente_devedor"]
+faltando = [c for c in colunas_esperadas if c not in df.columns]
+if faltando:
+    raise ValueError(f"Colunas faltando: {faltando}")
+
+# 3) TIPOS: manter simples
+df["oferta_maxima"] = pd.to_numeric(df["oferta_maxima"], errors="coerce").fillna(0)
+
+# 4) CPF TRATADO: só remove pontuação
+df["cpf_tratado"] = (
+    df["cpf_informado"].astype(str)
+      .str.replace(".", "", regex=False)
+      .str.replace("-", "", regex=False)
+)
+
+# 5) TABELA DE AGENTES (com novas colunas; valores 0 por enquanto)
+agentes_cols = [
+    "ID", "nome_agente",
+    "limite_min_score", "limite_max_score",
+    "capacidade_max_alocacao", "disponivel",
+    "codigo_agente"
+]
+
+agentes_rows = [  # id / agente / Limite Min Score / Limite Max Score / Capacidade Max / Disponivel / codigo
+    [305848318, "arlan-aprigio",       1_000_000,  1_000_000_000, 50, True,  305848318],  # Senior
+    [305130242, "William  Lobo",        0,          750_000,          40,    True, 305130242], 
+    [305449141, "Tainá Santos ",        0,          0,          0,    False, 305449141],
+    [301988975, "Karina Bertolotti",   0,          750_000,    40,   True,  301988975],   # Junior
+    [305938121, "Thiago Santos",       25_000,          1_000_000,  40,   True,  305938121],   # Pleno
+    [305848702, "Felipe França",       0,          500_000,    40,   True,  305848702],   # Em treinamento
+]
+
+df_agentes = pd.DataFrame(agentes_rows, columns=agentes_cols)
+
+
+# 6) MERGE SIMPLES: anexa dados de agente quando já há responsável por nome
+df = df.merge(
+    df_agentes,
+    how="left",
+    left_on="responsaveis",
+    right_on="nome_agente"
+)
+
+# 7) CPFs PRONTOS: "Novo Lead" e sem responsável
+cpfs_prontos = (
+    df[(df["fase_atual"] == "Novo Lead") & (df["responsaveis"].isna())]["cpf_tratado"]
+      .dropna().unique().tolist()
+)
+
+# 8) FASES VÁLIDAS: puxar todos os cards desses CPFs, ainda sem responsável
+fases_validas = [
+    "Precatórios a Qualificar", "Alçada - Pré análise",
+    "Extração Certidões", "Precificação", "Novo Lead"
+]
+df_cards_prontos = df[
+    (df["cpf_tratado"].isin(cpfs_prontos)) &
+    (df["responsaveis"].isna()) &
+    (df["fase_atual"].isin(fases_validas))
+].copy()
+
+# 9) COLUNAS FINAIS: manter simples e completo
+colunas_finais = [
+    "id", "fase_atual", "responsaveis", "cpf_informado", "oferta_maxima",
+    "cpf_tratado",
+    "ID", "nome_agente", "limite_min_score", "limite_max_score",
+    "capacidade_max_alocacao", "disponivel",
+    "codigo_agente"
+]
+df_cards_prontos = df_cards_prontos.reindex(columns=colunas_finais)
+
+# 10) SAÍDA: mesma estrutura esperada pelos próximos blocos
+output = {
+    "df": df.to_dict(orient="records"),
+    "df_cards_prontos_para_alocacao": df_cards_prontos.to_dict(orient="records"),
+    "df_agentes": df_agentes.to_dict(orient="records")
+}
+return output
