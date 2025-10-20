@@ -1,0 +1,394 @@
+# ============================================================
+# Identificacao_e_Verificacao_de_Grupos — versão com Assignee
+# ============================================================
+
+import json
+import pandas as pd
+import requests
+from datetime import datetime
+
+# ============================================================
+# 🔧 CONFIG — coloque aqui o link e a sua chave (com "Bearer ...")
+# ============================================================
+PIPEFY_API_URL = "https://api.pipefy.com/graphql"
+PIPEFY_API_TOKEN = "Bearer eyJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJQaXBlZnkiLCJpYXQiOjE3MDQ5MzQ0MTksImp0aSI6IjdhMjhmODE1LTA5YjEtNGI1YS1iNmJmLTQ1MjQ1MmExZTAyYyIsInN1YiI6MzA0MTgwNTgwLCJ1c2VyIjp7ImlkIjozMDQxODA1ODAsImVtYWlsIjoidmluaWNpdXMudWVoYXJhQGJhemFyZG9jb25zb3JjaW8uY29tLmJyIiwiYXBwbGljYXRpb24iOjMwMDMwODMzOSwic2NvcGVzIjpbXX0sImludGVyZmFjZV91dWlkIjpudWxsfQ.6MLoyV4QdcRY3rGsr7e2zuQLrRE6ytT_QQNBmBK0A_VHb-NVkyigQY64wTGt3hhXjhI3C3rkslpWRDvsK68hXA"
+
+# ============================================================
+# Funções auxiliares (HTTP/GraphQL + parsing de respostas)
+# ============================================================
+def _graphql(req_json):
+    headers = {"Authorization": PIPEFY_API_TOKEN, "Content-Type": "application/json"}
+    try:
+        resp = requests.post(PIPEFY_API_URL, json=req_json, headers=headers, timeout=20)
+        raw = resp.text
+        try:
+            j = resp.json()
+        except Exception:
+            j = {}
+        return resp.status_code, raw, j
+    except Exception as e:
+        return None, str(e), {}
+
+def _parse_update_field(json_obj):
+    obj = json_obj or {}
+    data = obj.get("data") or {}
+    node = data.get("updateCardField") or {}
+    success = bool(node.get("success")) if isinstance(node, dict) else False
+    return success, obj.get("errors")
+
+def _parse_update_card(json_obj):
+    obj = json_obj or {}
+    data = obj.get("data") or {}
+    node = data.get("updateCard") or {}
+    success = bool(node.get("card", {}).get("id"))
+    return success, obj.get("errors")
+
+def _sanitize_codigo_to_user_id(x) -> str:
+    s = str(x).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return "".join(ch for ch in s if ch.isdigit())
+
+def _to_df(source):
+    """Ingestão robusta: aceita DataFrame, dicts comuns, objetos com .data/.df."""
+    if isinstance(source, pd.DataFrame):
+        return source.copy()
+    if isinstance(source, dict):
+        if "df" in source:
+            return pd.DataFrame(source["df"])
+        if "data" in source:
+            d = source["data"]
+            if isinstance(d, pd.DataFrame):
+                return d.copy()
+            if isinstance(d, dict) and "df" in d:
+                return pd.DataFrame(d["df"])
+            if isinstance(d, (list, tuple)):
+                return pd.DataFrame(d)
+    try:
+        return pd.DataFrame(source.data.df)
+    except Exception:
+        try:
+            return pd.DataFrame(source.data)
+        except Exception:
+            return pd.DataFrame(source)
+
+def _coalesce_col(df, target, candidates, default=None):
+    """Garante que a coluna target exista (renomeia alias encontrado ou cria com default=None)."""
+    for c in candidates:
+        if c in df.columns:
+            if c != target:
+                df.rename(columns={c: target}, inplace=True)
+            return
+    if target not in df.columns:
+        df[target] = default
+
+def _df_json_safe(df: pd.DataFrame):
+    """Converte DataFrame em registros JSON-safe (None no lugar de NA/NaN/NaT)."""
+    df2 = df.copy()
+    for c in df2.columns:
+        if pd.api.types.is_datetime64_any_dtype(df2[c]):
+            df2[c] = df2[c].astype(str)
+    df2 = df2.astype(object).where(pd.notnull(df2), None)
+    return df2.to_dict(orient="records")
+
+def _list_json_safe(lst):
+    """Sanitiza listas/dicts aninhados contendo NaN/NA para None."""
+    if isinstance(lst, list):
+        return [_list_json_safe(x) for x in lst]
+    if isinstance(lst, dict):
+        return {k: _list_json_safe(v) for k, v in lst.items()}
+    try:
+        # cobre pd.NA, NaN etc
+        if pd.isna(lst):
+            return None
+    except Exception:
+        pass
+    return lst
+
+# ============================================================
+# ENTRADA: vem do bloco "Cards_prontos_para_alocacao"
+# ============================================================
+_src = getattr(Cards_prontos_para_alocacao, "data", Cards_prontos_para_alocacao)
+if isinstance(_src, dict) and "df" in _src:
+    df = pd.DataFrame(_src["df"])
+elif isinstance(_src, dict) and "df_cards_prontos_para_alocacao" in _src:
+    df = pd.DataFrame(_src["df_cards_prontos_para_alocacao"])
+else:
+    df = _to_df(_src)
+
+# Padroniza ID
+if "ID" in df.columns and "id" not in df.columns:
+    df = df.rename(columns={"ID": "id"})
+
+# ============================================================
+# PARTE 0 — NORMALIZAÇÃO + LIMPEZA + SCORE
+# ============================================================
+# 0.0) Normaliza colunas-chave (evita KeyError depois)
+_coalesce_col(df, "fase_atual", ["fase_atual", "fase", "phase_name", "current_phase", "current_phase_name", "etapa", "status"])
+_coalesce_col(df, "responsaveis", ["responsaveis", "responsável", "responsavel", "assignees", "assignees_ids", "owner", "owners"], default=None)
+_coalesce_col(df, "ente_devedor", ["ente_devedor", "ente", "devedor", "ente_devedor_nome"])
+_coalesce_col(df, "criado_em", ["criado_em", "created_at", "data_criacao", "created"], default=None)
+
+# 0.1) oferta_maxima (parser robusto BR/US/numérico)
+def parse_oferta(v):
+    if pd.isna(v):
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if "." in s and "," in s:      # "36.743,59"
+        s2 = s.replace(".", "").replace(",", ".")
+        val = pd.to_numeric(s2, errors="coerce")
+        return 0.0 if pd.isna(val) else float(val)
+    if "," in s and "." not in s:  # "36743,59"
+        s2 = s.replace(",", ".")
+        val = pd.to_numeric(s2, errors="coerce")
+        return 0.0 if pd.isna(val) else float(val)
+    val = pd.to_numeric(s, errors="coerce")  # "36743.59" ou "36743"
+    return 0.0 if pd.isna(val) else float(val)
+
+if "oferta_maxima" in df.columns:
+    df["oferta_maxima"] = df["oferta_maxima"].apply(parse_oferta).fillna(0.0)
+else:
+    df["oferta_maxima"] = 0.0
+
+# 0.2) Datas (gera criado_em_dt)
+df["criado_em_dt"] = pd.to_datetime(df.get("criado_em"), errors="coerce")
+
+# 0.3) CPF tratado (gera se não existir)
+if "cpf_tratado" not in df.columns:
+    src = None
+    for cand in ["cpf_tratado", "cpf_informado", "cpf", "documento", "documento_cpf"]:
+        if cand in df.columns:
+            src = cand
+            break
+    if src:
+        df["cpf_tratado"] = (
+            df[src].astype(str)
+                   .str.replace(".", "", regex=False)
+                   .str.replace("-", "", regex=False)
+                   .str.replace(" ", "", regex=False)
+                   .str.strip()
+        )
+    else:
+        df["cpf_tratado"] = None
+
+# 0.3.1) Normaliza "responsaveis" vazio/[]/None
+if "responsaveis" in df.columns:
+    df["responsaveis"] = df["responsaveis"].replace(["", "[]", None], None)
+
+# 0.4) Peso do ente
+def peso_ente_fn(v):
+    if pd.isna(v):
+        return 1.0
+    s = str(v).strip().lower()
+    if "inss" in s or "previd" in s or "seguro social" in s or "federal" in s:
+        return 3.0
+    elif "fazenda" in s:
+        return 2.0
+    else:
+        return 1.0
+
+df["peso_ente"] = df["ente_devedor"].apply(peso_ente_fn) if "ente_devedor" in df.columns else 1.0
+
+# 0.5) Peso da data
+hoje = pd.Timestamp(datetime.now().date())
+def peso_data_fn(d):
+    dias = 0 if pd.isna(d) else max(0, (hoje - pd.Timestamp(d).normalize()).days)
+    k = 1 - 0.05 * dias
+    if k < 0.5: k = 0.5
+    if k > 1.0: k = 1.0
+    return float(k)
+
+df["peso_data"] = df["criado_em_dt"].apply(peso_data_fn)
+
+# 0.6) Score final — força numérico pra evitar DatetimeArray em multiplicação
+for col, default in [("oferta_maxima", 0.0), ("peso_ente", 1.0), ("peso_data", 1.0)]:
+    df[col] = pd.to_numeric(df[col], errors="coerce").astype(float).fillna(default)
+
+df["score_precatorio"] = df["peso_ente"] * df["peso_data"] * df["oferta_maxima"]
+
+# ============================================================
+# PARTE 1 — HERANÇA (PRIORIDADE 1)
+# ============================================================
+fases_posteriores_com_agente = [
+    "Tentativa de Contato",
+    "Em negociação",
+    "Coleta de Documentos",
+    "Análise de Documentos",
+    "Checklist Documentos",
+    "Novo Lead",
+]
+
+if "codigo_agente" in df.columns:
+    df_com_agente = df[
+        (df["fase_atual"].isin(fases_posteriores_com_agente)) &
+        (df["codigo_agente"].notna())
+    ]
+else:
+    df_com_agente = df.iloc[0:0].copy()
+
+cols_map = ["cpf_tratado", "codigo_agente"] + (["nome_agente"] if "nome_agente" in df.columns else [])
+df_mapeamento = (df_com_agente.drop_duplicates(subset="cpf_tratado")[cols_map]
+                 if not df_com_agente.empty else pd.DataFrame(columns=cols_map))
+mapa_cpf_para_agente = df_mapeamento.set_index("cpf_tratado").to_dict(orient="index") if not df_mapeamento.empty else {}
+
+df_novos_leads_sem_agente = df[
+    (df["fase_atual"] == "Novo Lead") &
+    (df["responsaveis"].isna())
+].copy()
+
+df_para_herdar = df_novos_leads_sem_agente[
+    df_novos_leads_sem_agente["cpf_tratado"].isin(mapa_cpf_para_agente.keys())
+].copy() if mapa_cpf_para_agente else df.iloc[0:0].copy()
+
+cards_herdados_ids, log_heranca = [], []
+
+for _, row in df_para_herdar.iterrows():
+    card_id = str(row["id"])
+    cpf = row["cpf_tratado"]
+    info = mapa_cpf_para_agente.get(cpf, {})
+    codigo_agente = info.get("codigo_agente", "")
+    user_id = _sanitize_codigo_to_user_id(codigo_agente)
+
+    if not user_id:
+        log_heranca.append({
+            "card_id": card_id,
+            "status": "❌ Erro (Herança)",
+            "diagnostico": {"mensagem": "codigo_agente vazio/inválido", "codigo_agente": str(codigo_agente)}
+        })
+        continue
+
+    # A) tenta atualizar campo custom (se existir no seu pipe)
+    mutation_field = (
+        "mutation { updateCardField(input:{"
+        f'card_id: "{card_id}", field_id: "respons_vel_comercial", new_value: ["{user_id}"]'
+        "}) { success } }"
+    )
+    stA, rawA, jA = _graphql({"query": mutation_field})
+    okA, errA = _parse_update_field(jA)
+    if okA:
+        cards_herdados_ids.append(card_id)
+        log_heranca.append({
+            "card_id": card_id,
+            "status": "✅ Sucesso (Herança)",
+            "forma": "updateCardField",
+            "user_id": user_id
+        })
+        continue
+
+    # B) fallback: setar Assignee do card
+    mutation_card = (
+        "mutation { updateCard(input:{"
+        f'id: "{card_id}", assignees_ids: ["{user_id}"]'
+        "}) { card { id } } }"
+    )
+    stB, rawB, jB = _graphql({"query": mutation_card})
+    okB, errB = _parse_update_card(jB)
+    if okB:
+        cards_herdados_ids.append(card_id)
+        log_heranca.append({
+            "card_id": card_id,
+            "status": "✅ Sucesso (Herança)",
+            "forma": "updateCard(assignees_ids)",
+            "user_id": user_id
+        })
+    else:
+        log_heranca.append({
+            "card_id": card_id,
+            "status": "❌ Erro (Herança)",
+            "responsavel": user_id,
+            "diagnostico": {
+                "primeira_tentativa": errA,
+                "fallback": errB,
+                "http_status_A": stA,
+                "http_status_B": stB,
+                "rawB": (rawB or "")[:400]
+            }
+        })
+
+# Remove herdados do dataset e do ranking
+df_restante = df[~df["id"].isin(cards_herdados_ids)].copy() if len(cards_herdados_ids) else df.copy()
+
+# ============================================================
+# PARTE 2 — AGRUPAMENTO (PRONTOS x PENDENTES)
+# ============================================================
+fases_do_grupo = [
+    "Precatórios a Qualificar",
+    "Alçada - Pré análise",
+    "Alçada Tribunais",
+    "Extração Certidões",
+    "Precificação",
+]
+
+df_unassigned = df_restante[df_restante["responsaveis"].isna()].copy()
+
+cpfs_com_novo_lead = set(
+    df_unassigned[df_unassigned["fase_atual"] == "Novo Lead"]["cpf_tratado"].unique()
+)
+
+cpfs_bloqueantes = set(
+    df_unassigned[df_unassigned["fase_atual"].isin(fases_do_grupo)]["cpf_tratado"].unique()
+)
+
+cpfs_prontos = cpfs_com_novo_lead - cpfs_bloqueantes
+
+df_grupos_prontos = df_unassigned[
+    (df_unassigned["cpf_tratado"].isin(cpfs_prontos)) &
+    (df_unassigned["fase_atual"] == "Novo Lead")
+].copy()
+
+df_grupos_pendentes = df_unassigned[
+    df_unassigned["cpf_tratado"].isin(cpfs_bloqueantes)
+].copy()
+
+# ============================================================
+# PARTE 3 — df_pesos_cards (somente prontos, oferta > 0)
+# ============================================================
+cols = ["id", "cpf_tratado", "oferta_maxima", "peso_ente", "peso_data", "score_precatorio"]
+for c in cols:
+    if c not in df_grupos_prontos.columns:
+        df_grupos_prontos[c] = None  # None para ser JSON-safe
+
+df_pesos_cards = df_grupos_prontos[cols].copy()
+df_pesos_cards = df_pesos_cards[pd.to_numeric(df_pesos_cards["oferta_maxima"], errors="coerce").fillna(0) > 0]
+
+df_pesos_cards = (
+    df_pesos_cards
+    .sort_values("score_precatorio", ascending=False)
+    .drop_duplicates(subset="cpf_tratado")
+    .reset_index(drop=True)
+)
+
+# ============================================================
+# LOGS
+# ============================================================
+num_grupos_prontos = len(df_grupos_prontos["cpf_tratado"].unique()) if not df_grupos_prontos.empty else 0
+num_grupos_pendentes = len(df_grupos_pendentes["cpf_tratado"].unique()) if not df_grupos_pendentes.empty else 0
+
+log_agrupamento = [{
+    "status": "ℹ️ Info",
+    "detalhes_heranca": f"{len(cards_herdados_ids)} cards foram alocados por herança (não consomem capacidade).",
+    "detalhes_grupos_prontos": f"{num_grupos_prontos} CPFs prontos para alocação (somente Novo Lead).",
+    "detalhes_grupos_pendentes": f"{num_grupos_pendentes} CPFs aguardando alocação entre as fases Precatórios a Qualificar e Novo Lead. (Estoque)"
+}]
+
+# ============================================================
+# Conversão/limpeza final para JSON
+# ============================================================
+for _df in (df_grupos_prontos, df_grupos_pendentes, df_pesos_cards):
+    for col in _df.columns:
+        if pd.api.types.is_datetime64_any_dtype(_df[col]):
+            _df[col] = _df[col].astype(str)
+    _df[:] = _df.astype(object).where(pd.notnull(_df), None)
+
+# ============================================================
+# SAÍDA FINAL (compatível com o próximo bloco)
+# ============================================================
+output = {
+    "df_grupos_prontos": _df_json_safe(df_grupos_prontos),
+    "df_grupos_pendentes": _df_json_safe(df_grupos_pendentes),
+    "df_pesos_cards": _df_json_safe(df_pesos_cards),
+    "log_triagem": _list_json_safe(log_heranca + log_agrupamento)
+}
+return output
