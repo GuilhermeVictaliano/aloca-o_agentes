@@ -1,0 +1,465 @@
+# ==============================================================
+# Roteamento_dos_Grupos_Prontos — preparação para distribuição por pesos
+# ==============================================================
+
+import pandas as pd
+import numpy as np
+from datetime import datetime   # ✅ import necessário para _peso_data
+
+# =========================
+# 1) ENTRADAS (robustas)
+# =========================
+def _to_df(value, default_cols=None):
+    if isinstance(value, pd.DataFrame):
+        return value.copy()
+    if value is None:
+        return pd.DataFrame(columns=default_cols or [])
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return pd.DataFrame(columns=default_cols or [])
+        if isinstance(value[0], dict):
+            return pd.DataFrame(value)
+        if isinstance(value[0], pd.DataFrame):
+            return pd.concat(value, ignore_index=True)
+        return pd.DataFrame(value)
+    if isinstance(value, dict):
+        # dict simples → linha única
+        if any(not isinstance(v, (list, dict, pd.DataFrame)) for v in value.values()):
+            return pd.DataFrame([value])
+        # tentar converter subestruturas
+        for v in value.values():
+            try:
+                return pd.DataFrame(v)
+            except Exception:
+                continue
+        return pd.DataFrame(columns=default_cols or [])
+    try:
+        return pd.DataFrame(value)
+    except Exception:
+        return pd.DataFrame(columns=default_cols or [])
+
+def _extract_payload(container):
+    return getattr(container, "data", container)
+
+def _find_key(payload, key):
+    if payload is None:
+        return None
+    if isinstance(payload, dict):
+        if key in payload:
+            return payload[key]
+        for v in payload.values():
+            if isinstance(v, dict) and key in v:
+                return v[key]
+            if isinstance(v, list):
+                for it in v:
+                    if isinstance(it, dict) and key in it:
+                        return it[key]
+        return None
+    if isinstance(payload, (list, tuple)):
+        for it in payload:
+            if isinstance(it, dict) and key in it:
+                return it[key]
+            if hasattr(it, key):
+                return getattr(it, key)
+    if hasattr(payload, key):
+        return getattr(payload, key)
+    return None
+
+def _safe_get_df(container, key, default_cols=None):
+    payload = _extract_payload(container)
+    value = _find_key(payload, key)
+    return _to_df(value, default_cols=default_cols)
+
+# Carrega
+df_grupos_prontos = _safe_get_df(Identificacao_e_Verificacao_de_Grupos, "df_grupos_prontos")
+df_pesos_cards    = _safe_get_df(Identificacao_e_Verificacao_de_Grupos, "df_pesos_cards")
+df_agentes        = _safe_get_df(Cards_prontos_para_alocacao, "df_agentes",
+                                 default_cols=["codigo_agente","nome_agente","disponivel",
+                                               "limite_min_score","limite_max_score","capacidade_max_alocacao"])
+df_all            = _safe_get_df(Cards_prontos_para_alocacao, "df")
+
+log_msgs = []
+log_msgs.append(f"df_grupos_prontos: {df_grupos_prontos.shape}")
+log_msgs.append(f"df_pesos_cards: {df_pesos_cards.shape}")
+log_msgs.append(f"df_agentes: {df_agentes.shape}")
+log_msgs.append(f"df_all: {df_all.shape}")
+
+# =========================
+# 2) HELPERS
+# =========================
+def normalizar_cpf_serie(serie):
+    return (serie.astype(str)
+                 .str.replace(".", "", regex=False)
+                 .str.replace("-", "", regex=False)
+                 .str.strip())
+
+def ensure_cpf_tratado(df):
+    if "cpf_tratado" in df.columns:
+        df["cpf_tratado"] = normalizar_cpf_serie(df["cpf_tratado"])
+    elif "cpf_informado" in df.columns:
+        df["cpf_tratado"] = normalizar_cpf_serie(df["cpf_informado"])
+    else:
+        df["cpf_tratado"] = ""
+    return df
+
+def normalize_id(df):
+    if "ID" in df.columns and "id" not in df.columns:
+        df.rename(columns={"ID": "id"}, inplace=True)
+    if "id" in df.columns:
+        df["id"] = df["id"].astype(str).str.strip()
+    return df
+
+def ensure_canonical_columns(df, aliases_map):
+    for canonical, alts in aliases_map.items():
+        if canonical in df.columns:
+            continue
+        for alt in alts:
+            if alt in df.columns:
+                df[canonical] = df[alt]
+                break
+        if canonical not in df.columns:
+            df[canonical] = np.nan
+    return df
+
+def coalesce_cols(df, target, right_suf="_pesos", left_suf="_grp"):
+    r = f"{target}{right_suf}"
+    l = f"{target}{left_suf}"
+    if r not in df.columns:
+        df[r] = np.nan
+    if l not in df.columns:
+        df[l] = np.nan
+    df[target] = df[r].where(pd.notna(df[r]), df[l].where(pd.notna(df[l]), df.get(target, np.nan)))
+    df.drop(columns=[c for c in (r, l) if c in df.columns], inplace=True, errors="ignore")
+    return df
+
+# =========================
+# 3) SANIDADE
+# =========================
+for d in (df_grupos_prontos, df_pesos_cards, df_all):
+    if "ID" in d.columns and "id" not in d.columns:
+        d.rename(columns={"ID": "id"}, inplace=True)
+
+df_grupos_prontos = normalize_id(df_grupos_prontos)
+df_pesos_cards    = normalize_id(df_pesos_cards)
+df_grupos_prontos = ensure_cpf_tratado(df_grupos_prontos)
+df_pesos_cards    = ensure_cpf_tratado(df_pesos_cards)
+df_all            = ensure_cpf_tratado(df_all)
+
+aliases = {
+    "score_precatorio": ["score_precatorio","score","score_final","score_total","score_prec"],
+    "oferta_maxima":    ["oferta_maxima","oferta","valor_oferta","max_oferta","max_offer"],
+    "peso_ente":        ["peso_ente","peso_ente_fn","peso_ente_calc","peso_ente_score"],
+    "peso_data":        ["peso_data","peso_data_fn","peso_data_calc","peso_data_score"],
+    "cpf_tratado":      ["cpf_tratado","cpf_informado","cpf"]
+}
+df_pesos_cards = ensure_canonical_columns(df_pesos_cards, aliases)
+
+# =========================
+# 4) MERGE com sufixos + COALESCE
+# =========================
+right_cols_target = ["id","cpf_tratado","score_precatorio","peso_ente","peso_data","oferta_maxima"]
+for c in right_cols_target:
+    if c not in df_pesos_cards.columns:
+        df_pesos_cards[c] = np.nan
+
+if not df_grupos_prontos.empty and not df_pesos_cards.empty:
+    df_candidatos = df_grupos_prontos.merge(
+        df_pesos_cards[right_cols_target],
+        on="id", how="left", suffixes=("_grp", "_pesos")
+    )
+else:
+    df_candidatos = pd.DataFrame(columns=right_cols_target)
+
+df_candidatos = ensure_cpf_tratado(df_candidatos)
+for col in ["cpf_tratado", "score_precatorio", "oferta_maxima", "peso_ente", "peso_data"]:
+    df_candidatos = coalesce_cols(df_candidatos, col, right_suf="_pesos", left_suf="_grp")
+
+# =========================
+# 5) DIAGNÓSTICO
+# =========================
+try:
+    n_left  = df_grupos_prontos["id"].nunique() if "id" in df_grupos_prontos.columns else 0
+    n_right = df_pesos_cards["id"].nunique() if "id" in df_pesos_cards.columns else 0
+    n_inner = (df_grupos_prontos[["id"]].merge(df_pesos_cards[["id"]], on="id", how="inner")["id"]
+               .nunique() if n_left and n_right else 0)
+    log_msgs.append(f"Match de IDs (grupos_prontos x pesos_cards): {n_inner}/{n_left} (right: {n_right})")
+except Exception:
+    log_msgs.append("Match de IDs: diagnóstico indisponível.")
+
+cols_chk = ["score_precatorio","oferta_maxima","peso_ente","peso_data"]
+faltando = df_candidatos[cols_chk].isna().any(axis=True).sum() if not df_candidatos.empty else 0
+log_msgs.append(f"Candidatos com NaN em {cols_chk}: {faltando}")
+if faltando > 0:
+    ids_falt = (df_candidatos[df_candidatos[cols_chk].isna().any(axis=True)]["id"]
+                .astype(str).head(15).tolist())
+    log_msgs.append(f"Exemplos de IDs com NaN pós-merge: {ids_falt}")
+
+# =========================
+# 6) ORDENAÇÃO E PRÉ-FILTRO
+# =========================
+df_candidatos["__score_sort__"] = pd.to_numeric(df_candidatos["score_precatorio"], errors="coerce")
+df_candidatos.sort_values(by="__score_sort__", ascending=False, inplace=True, ignore_index=True)
+df_candidatos.drop(columns="__score_sort__", inplace=True)
+
+antes = len(df_candidatos)
+df_candidatos_validos = df_candidatos[pd.to_numeric(df_candidatos["score_precatorio"], errors="coerce") > 0].copy()
+removidos = antes - len(df_candidatos_validos)
+log_msgs.append(f"Pré-filtro: removidos {removidos} candidatos com score<=0/NaN.")
+
+# =========================
+# 7) AGRUPAMENTO POR CPF
+# =========================
+if df_candidatos_validos.empty:
+    output = {
+        "df_candidates_scored_master": [],
+        "df_agentes_capacidade": [],
+        "tabelas_por_agente": {},
+        "mapa_agente": {},
+        "mapa_cpf_para_ids": {},
+        "log_roteamento_prep": log_msgs + ["Sem candidatos válidos (score>0)."]
+    }
+    return output
+
+serie_lista_ids = df_candidatos_validos.groupby("cpf_tratado")["id"].apply(list)
+mapa_cpf_para_ids = {str(k): [str(x) for x in v] for k, v in serie_lista_ids.to_dict().items()}
+
+df_candidates_scored_master = df_candidatos_validos.drop_duplicates(subset="cpf_tratado", keep="first").copy()
+df_candidates_scored_master["qtd_cards_cpf"] = df_candidates_scored_master["cpf_tratado"].map(
+    lambda c: len(mapa_cpf_para_ids.get(str(c), []))
+)
+df_candidates_scored_master["cards_ids_do_cpf"] = df_candidates_scored_master["cpf_tratado"].map(
+    lambda c: mapa_cpf_para_ids.get(str(c), [])
+)
+
+# =========================
+# 8) CAPACIDADE DOS AGENTES
+# =========================
+if df_all.empty or df_agentes.empty:
+    output = {
+        "df_candidates_scored_master": df_candidates_scored_master.to_dict(orient="records"),
+        "df_agentes_capacidade": df_agentes.to_dict(orient="records"),
+        "tabelas_por_agente": {},
+        "mapa_agente": {},
+        "mapa_cpf_para_ids": mapa_cpf_para_ids,
+        "log_roteamento_prep": log_msgs + ["Sem base de cards completa ou sem tabela de agentes."]
+    }
+    return output
+
+df_resp = df_all[df_all["responsaveis"].notna()].copy()
+df_resp = ensure_cpf_tratado(df_resp)
+
+if "cpf_tratado" in df_resp.columns and "responsaveis" in df_resp.columns:
+    carga_por_responsavel = (
+        df_resp.groupby("responsaveis")["cpf_tratado"].nunique()
+               .reset_index().rename(columns={"cpf_tratado": "cpfs_atribuidos_atuais"})
+    )
+else:
+    carga_por_responsavel = pd.DataFrame(columns=["responsaveis", "cpfs_atribuidos_atuais"])
+
+df_cap = df_agentes.merge(carga_por_responsavel, how="left",
+                          left_on="nome_agente", right_on="responsaveis")
+
+df_cap["cpfs_atribuidos_atuais"] = pd.to_numeric(df_cap["cpfs_atribuidos_atuais"], errors="coerce").fillna(0).astype(int)
+df_cap["capacidade_max_alocacao"] = pd.to_numeric(df_cap["capacidade_max_alocacao"], errors="coerce").fillna(0).astype(int)
+df_cap["capacidade_restante"] = (df_cap["capacidade_max_alocacao"] - df_cap["cpfs_atribuidos_atuais"]).clip(lower=0)
+
+cols_cap = ["ID","codigo_agente","nome_agente","disponivel",
+            "limite_min_score","limite_max_score","capacidade_max_alocacao",
+            "cpfs_atribuidos_atuais","capacidade_restante"]
+for c in cols_cap:
+    if c not in df_cap.columns:
+        df_cap[c] = np.nan
+df_cap = df_cap[cols_cap].copy()
+
+# =========================
+# 8.1) EXISTENTES COM RESPONSÁVEL (padronizados)
+# =========================
+fases_existentes = {"Novo Lead", "Tentativa de Contato", "Em negociação"}
+
+df_exist = df_all.copy()
+df_exist = normalize_id(df_exist)
+df_exist = ensure_cpf_tratado(df_exist)
+
+def _parse_oferta(v):
+    if pd.isna(v): return 0.0
+    if isinstance(v, (int, float)): return float(v)
+    s = str(v).strip()
+    if "." in s and "," in s: s = s.replace(".", "").replace(",", ".")
+    elif "," in s and "." not in s: s = s.replace(",", ".")
+    val = pd.to_numeric(s, errors="coerce")
+    return 0.0 if pd.isna(val) else float(val)
+
+def _peso_ente(v):
+    if pd.isna(v): return 1.0
+    s = str(v).strip().lower()
+    if ("inss" in s) or ("previd" in s) or ("seguro social" in s) or ("federal" in s):
+        return 3.0
+    elif "fazenda" in s:
+        return 2.0
+    else:
+        return 1.0
+
+_hoje = pd.Timestamp(datetime.now().date())
+def _peso_data(d):
+    dias = 0 if pd.isna(d) else max(0, (_hoje - pd.Timestamp(d).normalize()).days)
+    k = 1 - 0.05 * dias
+    if k < 0.5: k = 0.5
+    if k > 1.0: k = 1.0
+    return float(k)
+
+df_exist = df_exist[
+    df_exist["responsaveis"].notna()
+    & df_exist["fase_atual"].isin(fases_existentes)
+].copy()
+
+if "oferta_maxima" in df_exist.columns:
+    df_exist["oferta_maxima"] = df_exist["oferta_maxima"].apply(_parse_oferta).fillna(0.0)
+else:
+    df_exist["oferta_maxima"] = 0.0
+
+if "ente_devedor" not in df_exist.columns:
+    df_exist["ente_devedor"] = None
+df_exist["peso_ente"] = df_exist["ente_devedor"].apply(_peso_ente)
+
+criado_col = None
+for cand in ["criado_em", "created_at", "data_criacao", "created"]:
+    if cand in df_exist.columns:
+        criado_col = cand
+        break
+if criado_col:
+    df_exist["criado_em_dt"] = pd.to_datetime(df_exist[criado_col], errors="coerce")
+else:
+    df_exist["criado_em_dt"] = pd.NaT
+
+df_exist["peso_data"] = df_exist["criado_em_dt"].apply(_peso_data)
+df_exist["score_precatorio"] = (
+    pd.to_numeric(df_exist["oferta_maxima"], errors="coerce").fillna(0.0).astype(float)
+    * pd.to_numeric(df_exist["peso_ente"], errors="coerce").fillna(1.0).astype(float)
+    * pd.to_numeric(df_exist["peso_data"], errors="coerce").fillna(1.0).astype(float)
+)
+
+serie_ids_all = df_all.groupby("cpf_tratado")["id"].apply(lambda s: [str(x) for x in s.astype(str)]).reset_index()
+map_all_ids = dict(zip(serie_ids_all["cpf_tratado"].astype(str), serie_ids_all["id"]))
+
+# =========================
+# Merge seguro entre df_exist e df_cap (por nome do agente)
+# =========================
+
+# Normaliza para evitar falhas por maiúsculas, acentos ou espaços
+df_exist["responsaveis_norm"] = df_exist["responsaveis"].astype(str).str.strip().str.lower()
+df_cap["nome_agente_norm"] = df_cap["nome_agente"].astype(str).str.strip().str.lower()
+
+try:
+    df_exist_join = df_exist.merge(
+        df_cap[["nome_agente_norm", "codigo_agente", "nome_agente"]],
+        how="left",
+        left_on="responsaveis_norm",
+        right_on="nome_agente_norm"
+    )
+except Exception:
+    df_exist_join = df_exist.copy()
+    df_exist_join["nome_agente"] = None
+    df_exist_join["codigo_agente"] = None
+
+
+
+# 🔒 Garante que as colunas existam antes de qualquer uso
+if "codigo_agente" not in df_exist_join.columns:
+    df_exist_join["codigo_agente"] = None
+if "nome_agente" not in df_exist_join.columns:
+    df_exist_join["nome_agente"] = None
+
+# Padroniza colunas para ficarem IGUAIS às do df_consolidado
+cols_final = [
+    "codigo_agente", "nome_agente", "cpf_tratado",
+    "cards_ids_do_cpf", "score_precatorio", "oferta_maxima",
+    "peso_ente", "peso_data"
+]
+
+# ✅ Conversão segura para string
+df_exist_join["codigo_agente"] = df_exist_join["codigo_agente"].apply(
+    lambda v: str(int(v)) if pd.notna(v) and str(v).strip().isdigit() else "Não Alocado"
+)
+
+df_exist_join["nome_agente"] = (
+    df_exist_join["nome_agente"]
+    .fillna(df_exist_join.get("responsaveis"))
+    .fillna("Não Alocado")
+)
+
+def _map_cards_ids(cpf):
+    """Retorna lista de IDs para o CPF, mesmo se o valor não existir."""
+    try:
+        val = map_all_ids.get(str(cpf))
+        if isinstance(val, list):
+            return val
+        if pd.isna(val) or val is None:
+            return []
+        return [str(val)]
+    except Exception:
+        return []
+
+df_exist_join["cards_ids_do_cpf"] = df_exist_join["cpf_tratado"].apply(_map_cards_ids)
+
+
+df_existentes_padronizado = df_exist_join[cols_final].copy()
+
+
+# Monta tabela final padronizada
+df_existentes_padronizado = df_exist_join[cols_final].copy()
+
+# Diagnóstico no log
+log_msgs.append(f"Existentes com responsável (fases alvo): {len(df_existentes_padronizado)}")
+
+# =========================
+# 9) TABELAS VAZIAS POR AGENTE
+# =========================
+colunas_cards = ["id","cpf_tratado","oferta_maxima","score_precatorio","peso_ente","peso_data","cards_ids_do_cpf"]
+tabelas_por_agente = {}
+mapa_agente = {}
+
+for _, row in df_cap.iterrows():
+    codigo = row.get("codigo_agente", row.get("ID"))
+    nome = row.get("nome_agente")
+    if pd.isna(codigo):
+        continue
+    try:
+        codigo_str = str(int(codigo))
+    except Exception:
+        codigo_str = str(codigo)
+    mapa_agente[codigo_str] = nome if pd.notna(nome) else ""
+    tabelas_por_agente[codigo_str] = pd.DataFrame(columns=colunas_cards).to_dict(orient="records")
+
+# =========================
+# 10) LOG FINAL + SAÍDA
+# =========================
+log_msgs.append(f"CPFs candidatos (master por CPF): {len(df_candidates_scored_master)}")
+log_msgs.append(f"Total de agentes: {len(df_cap)}")
+if "capacidade_restante" in df_cap.columns:
+    total_capacidade = int(df_cap["capacidade_restante"].fillna(0).sum())
+    log_msgs.append(f"Capacidade total restante (soma, CPFs): {total_capacidade}")
+
+# Converte df_existentes_padronizado para formato JSON-safe
+def _df_json_safe(df: pd.DataFrame):
+    """Evita problemas de serialização para Retool."""
+    df2 = df.copy()
+    for c in df2.columns:
+        if pd.api.types.is_datetime64_any_dtype(df2[c]):
+            df2[c] = df2[c].astype(str)
+    df2 = df2.astype(object).where(pd.notnull(df2), None)
+    return df2.to_dict(orient="records")
+
+# =========================
+# SAÍDA FINAL
+# =========================
+output = {
+    "df_existentes_padronizado": _df_json_safe(df_existentes_padronizado),  # ✅ cards já alocados
+    "df_candidates_scored_master": df_candidates_scored_master.to_dict(orient="records"),
+    "df_agentes_capacidade": df_cap.to_dict(orient="records"),
+    "tabelas_por_agente": tabelas_por_agente,
+    "mapa_agente": mapa_agente,
+    "mapa_cpf_para_ids": mapa_cpf_para_ids,
+    "log_roteamento_prep": log_msgs
+}
+
+return output
