@@ -1,0 +1,364 @@
+# ==============================================================
+# Alocacao_agentes_comercial — Seleção de cards por agente
+# ==============================================================
+# Lógica de alocação com base em:
+#   - score dos precatórios (score_precatorio)
+#   - limites de score e capacidade dos agentes
+#   - associação de CPFs com múltiplos cards
+#
+# Entradas (do bloco "Roteamento_dos_Grupos_Prontos"):
+#   • df_candidates_scored_master  →  cards principais por CPF
+#   • df_agentes_capacidade        →  agentes com limites/capacidade
+#   • tabelas_por_agente           →  estrutura inicial de dicionário {codigo_agente -> []}
+#   • mapa_agente, mapa_cpf_para_ids
+#
+# Saídas:
+#   • tabelas_por_agente preenchidas
+#   • df_allocations_flat (visão achatada)
+#   • df_nao_alocados
+#   • logs resumidos
+# ==============================================================
+
+import pandas as pd
+import numpy as np
+from math import inf
+
+# ==============================================================
+# 1) ENTRADAS
+# ==============================================================
+
+df_master = pd.DataFrame(Roteamento_dos_Grupos_Prontos.data.df_candidates_scored_master).copy()
+df_cap    = pd.DataFrame(Roteamento_dos_Grupos_Prontos.data.df_agentes_capacidade).copy()
+tabelas_por_agente = dict(Roteamento_dos_Grupos_Prontos.data.tabelas_por_agente)
+mapa_agente        = dict(Roteamento_dos_Grupos_Prontos.data.mapa_agente)
+mapa_cpf_para_ids  = dict(Roteamento_dos_Grupos_Prontos.data.mapa_cpf_para_ids)
+
+# ==============================================================
+# 2) SANIDADE SIMPLES E GARANTIA DE COLUNAS
+# ==============================================================
+
+# Garante que df_master tenha todas as colunas essenciais
+colunas_necessarias = [
+    "cpf_tratado", "oferta_maxima",
+    "score_precatorio", "peso_ente", "peso_data"
+]
+for col in colunas_necessarias:
+    if col not in df_master.columns:
+        # cria a coluna caso não exista
+        if col == "cpf_tratado":
+            df_master[col] = ""
+        else:
+            df_master[col] = 0
+
+# Converte os tipos adequados
+for c in ["score_precatorio", "oferta_maxima", "peso_ente", "peso_data"]:
+    df_master[c] = pd.to_numeric(df_master[c], errors="coerce").fillna(0)
+
+# Normaliza o CPF
+df_master["cpf_tratado"] = (
+    df_master["cpf_tratado"]
+    .astype(str)
+    .str.replace(".", "", regex=False)
+    .str.replace("-", "", regex=False)
+    .str.strip()
+)
+
+# Garante que df_cap tenha as colunas esperadas
+for col in [
+    "ID", "codigo_agente", "nome_agente",
+    "disponivel", "limite_min_score",
+    "limite_max_score", "capacidade_restante"
+]:
+    if col not in df_cap.columns:
+        df_cap[col] = np.nan
+
+# Tipos numéricos nos limites e capacidade
+for col in ["limite_min_score", "limite_max_score", "capacidade_restante"]:
+    df_cap[col] = pd.to_numeric(df_cap[col], errors="coerce").fillna(0)
+
+# ==============================================================
+# 3) PREPARAÇÃO BÁSICA
+# ==============================================================
+
+# Converte código para string (chave no dict)
+def to_code_str(v):
+    try:
+        return str(int(v))
+    except:
+        return None
+
+df_cap["codigo_key"] = df_cap.apply(
+    lambda r: to_code_str(r.get("codigo_agente", r.get("ID"))), axis=1
+)
+
+# Filtra agentes disponíveis e com capacidade
+df_agentes_ativos = df_cap[
+    (df_cap["disponivel"] == 1)
+    & (df_cap["capacidade_restante"] > 0)
+    & df_cap["codigo_key"].notna()
+].copy()
+
+if df_agentes_ativos.empty:
+    output = {
+        "tabelas_por_agente": tabelas_por_agente,
+        "df_allocations_flat": [],
+        "df_nao_alocados": df_master.to_dict(orient="records"),
+        "log_alocacao": ["Nenhum agente disponível com capacidade."]
+    }
+    return output
+
+# Ordena agentes: primeiro os com maiores limites máximos
+df_agentes_ativos.sort_values(
+    by=["limite_max_score", "limite_min_score"],
+    ascending=[False, False],
+    inplace=True,
+    ignore_index=True
+)
+
+# ==============================================================
+# 4) ESTRUTURAS DE APOIO
+# ==============================================================
+
+# Ordena os candidatos por score (desc)
+df_master = df_master.sort_values(by="score_precatorio", ascending=False).reset_index(drop=True)
+cpfs_ordenados = df_master["cpf_tratado"].astype(str).tolist()
+
+# Mapas rápidos
+score_por_cpf = {str(r["cpf_tratado"]): float(r["score_precatorio"]) for _, r in df_master.iterrows()}
+master_por_cpf = {str(r["cpf_tratado"]): r for _, r in df_master.iterrows()}
+
+# Estado de alocação e capacidades
+cpf_alocado_em = {}
+cap_restante = {row["codigo_key"]: int(row["capacidade_restante"]) for _, row in df_agentes_ativos.iterrows()}
+
+# ==============================================================
+# 5) FUNÇÕES AUXILIARES
+# ==============================================================
+
+def dentro_intervalo(ag_row, score):
+    """Retorna True se o score estiver dentro do intervalo [min, max] do agente."""
+    min_s = float(ag_row.get("limite_min_score", 0) or 0)
+    max_s = float(ag_row.get("limite_max_score", 0) or 0)
+    if max_s <= 0:
+        max_s = float("inf")
+    return (score >= min_s) and (score <= max_s)
+
+def elegivel(ag_row, cpf):
+    """Verifica se o agente tem capacidade e o CPF cabe no intervalo."""
+    cod = ag_row["codigo_key"]
+    if cap_restante.get(cod, 0) <= 0:
+        return False
+    score = score_por_cpf.get(str(cpf), 0.0)
+    return dentro_intervalo(ag_row, score)
+
+def alocar(ag_row, cpf):
+    """Realiza a alocação do CPF ao agente."""
+    cod = ag_row["codigo_key"]
+    nome = mapa_agente.get(cod, ag_row.get("nome_agente", ""))
+    if str(cpf) in cpf_alocado_em:
+        return False
+    if cap_restante.get(cod, 0) <= 0:
+        return False
+
+    # Registro principal
+    m = master_por_cpf[str(cpf)]
+    todos_ids = mapa_cpf_para_ids.get(str(cpf), [])
+    registro = {
+        "id": m.get("id"),
+        "cpf_tratado": str(cpf),
+        "oferta_maxima": m.get("oferta_maxima", 0),
+        "score_precatorio": m.get("score_precatorio", 0),
+        "peso_ente": m.get("peso_ente", 0),
+        "peso_data": m.get("peso_data", 0),
+        "cards_ids_do_cpf": todos_ids
+    }
+
+    # Garante que o agente tenha lista
+    if cod not in tabelas_por_agente:
+        tabelas_por_agente[cod] = []
+    tabelas_por_agente[cod].append(registro)
+
+    # Deduz 1 da capacidade (1 CPF = 1 capacidade)
+    cpf_alocado_em[str(cpf)] = cod
+    cap_restante[cod] = cap_restante.get(cod, 0) - 1
+    return True
+
+# ==============================================================
+# 6) ALOCAÇÃO PRINCIPAL
+# ==============================================================
+
+agentes = df_agentes_ativos.reset_index(drop=True)
+
+# Função para pegar o limite máximo do próximo agente
+def prox_max(i):
+    if i + 1 < len(agentes):
+        max_next = float(agentes.loc[i + 1, "limite_max_score"] or 0)
+        return max_next
+    return -inf
+
+# Etapa 1 — faixa primária de cada agente
+for i in range(len(agentes)):
+    ag = agentes.loc[i]
+    cod = ag["codigo_key"]
+    if cap_restante.get(cod, 0) <= 0:
+        continue
+
+    max_i = float(ag.get("limite_max_score", 0) or 0) or float("inf")
+    min_i = float(ag.get("limite_min_score", 0) or 0)
+    max_prox = prox_max(i)
+    limite_inferior_exclusivo = max_prox if max_prox > 0 else -inf
+
+    for cpf in cpfs_ordenados:
+        if cap_restante.get(cod, 0) <= 0:
+            break
+        if cpf in cpf_alocado_em:
+            continue
+        sc = score_por_cpf.get(cpf, 0.0)
+        if sc > limite_inferior_exclusivo and sc <= max_i and sc >= min_i:
+            alocar(ag, cpf)
+
+# Etapa 2 — interleaving (vice-versa) até preencher capacidades
+capacidade_total = sum(max(0, v) for v in cap_restante.values())
+if capacidade_total > 0:
+    houve_alocacao = True
+    guard = 0
+    while houve_alocacao and guard < 100000:
+        houve_alocacao = False
+        guard += 1
+        for i in range(len(agentes)):
+            ag = agentes.loc[i]
+            cod = ag["codigo_key"]
+            if cap_restante.get(cod, 0) <= 0:
+                continue
+            for cpf in cpfs_ordenados:
+                if cpf in cpf_alocado_em:
+                    continue
+                if elegivel(ag, cpf):
+                    if alocar(ag, cpf):
+                        houve_alocacao = True
+                    break
+        if not houve_alocacao:
+            break
+
+# ==============================================================
+# 7) RESULTADOS
+# ==============================================================
+
+linhas = []
+for cod, regs in tabelas_por_agente.items():
+    for r in regs:
+        linhas.append({
+            "codigo_agente": cod,
+            "nome_agente": mapa_agente.get(cod, ""),
+            "cpf_tratado": r.get("cpf_tratado"),
+            "master_card_id": r.get("id"),
+            "cards_ids_do_cpf": r.get("cards_ids_do_cpf", []),
+            "score_precatorio": r.get("score_precatorio", 0),
+            "oferta_maxima": r.get("oferta_maxima", 0),
+            "peso_ente": r.get("peso_ente", 0),
+            "peso_data": r.get("peso_data", 0)
+        })
+
+df_allocations_flat = pd.DataFrame(linhas)
+
+# Não alocados
+cpfs_alocados = set(cpf_alocado_em.keys())
+df_nao_alocados = df_master[~df_master["cpf_tratado"].astype(str).isin(cpfs_alocados)].copy()
+
+# ==============================================================
+# 8) LOGS
+# ==============================================================
+
+logs = []
+logs.append(f"Agentes ativos com capacidade: {len(df_agentes_ativos)}")
+logs.append(f"CPFs candidatos (master): {len(df_master)}")
+logs.append(f"CPFs alocados: {len(cpfs_alocados)}")
+
+if not df_allocations_flat.empty:
+    resumo = (
+        df_allocations_flat
+        .groupby(["codigo_agente", "nome_agente"])["cpf_tratado"]
+        .nunique()
+        .reset_index()
+        .rename(columns={"cpf_tratado": "cpfs_alocados"})
+    )
+    for _, row in resumo.iterrows():
+        logs.append(f"  - {row['nome_agente']} ({row['codigo_agente']}): {row['cpfs_alocados']} CPFs")
+
+
+      
+# ==============================================================
+# 8.1) TABELA CONSOLIDADA (ALOCADOS + NÃO ALOCADOS)
+# ==============================================================
+
+colunas_comuns = [
+    "codigo_agente", "nome_agente", "cpf_tratado",
+    "cards_ids_do_cpf", "score_precatorio", "oferta_maxima",
+    "peso_ente", "peso_data"
+]
+
+# Prepara a tabela de alocados
+if not df_allocations_flat.empty:
+    df1 = df_allocations_flat[colunas_comuns].copy()
+else:
+    df1 = pd.DataFrame(columns=colunas_comuns)
+
+# Prepara a tabela de não alocados
+if not df_nao_alocados.empty:
+    # Adiciona colunas que faltam com valores padrão
+    df2 = df_nao_alocados.copy()
+    df2["codigo_agente"] = "Não Alocado"
+    df2["nome_agente"] = "Não Alocado"
+    
+    # Garante a existência da coluna 'cards_ids_do_cpf' se ela não vier de df_master
+    if "cards_ids_do_cpf" not in df2.columns:
+        # Recria a partir do mapa original para garantir a consistência
+        df2["cards_ids_do_cpf"] = df2["cpf_tratado"].apply(lambda c: mapa_cpf_para_ids.get(str(c), []))
+        
+    df2 = df2[colunas_comuns]
+else:
+    df2 = pd.DataFrame(columns=colunas_comuns)
+
+# Junta as duas tabelas
+df_consolidado = pd.concat([df1, df2], ignore_index=True)
+
+# Ordena pela coluna "score_precatorio" (do maior para o menor)
+df_consolidado = df_consolidado.sort_values(by="score_precatorio", ascending=False).reset_index(drop=True)
+
+# Adiciona log da nova tabela
+logs.append(f"Tabela consolidada (alocados + não alocados) criada com {len(df_consolidado)} registros.")
+
+# ==============================
+# 8.2) CONSOLIDADO TOTAL (existentes + alocados novos + não alocados)
+# ==============================
+try:
+    df_existentes_padronizado = pd.DataFrame(
+        getattr(Roteamento_dos_Grupos_Prontos, "data", Roteamento_dos_Grupos_Prontos).get("df_existentes_padronizado", [])
+    )
+except Exception:
+    df_existentes_padronizado = pd.DataFrame(columns=df_consolidado.columns)
+
+# Garante mesmas colunas
+for c in ["codigo_agente","nome_agente","cpf_tratado","cards_ids_do_cpf","score_precatorio","oferta_maxima","peso_ente","peso_data"]:
+    if c not in df_existentes_padronizado.columns:
+        df_existentes_padronizado[c] = np.nan
+
+df_consolidado_total = pd.concat([df_existentes_padronizado, df_consolidado], ignore_index=True)
+df_consolidado_total = df_consolidado_total.sort_values(by="score_precatorio", ascending=False).reset_index(drop=True)
+
+logs.append(f"Consolidado TOTAL criado com {len(df_consolidado_total)} registros (existentes + novos + não alocados).")
+
+
+# ==============================================================
+# 9) SAÍDA FINAL
+# ==============================================================
+
+output = {
+    "df_consolidado_total": df_consolidado_total.to_dict(orient="records"),
+    "tabelas_por_agente": tabelas_por_agente,
+    "df_allocations_flat": df_allocations_flat.to_dict(orient="records"),
+    "df_nao_alocados": df_nao_alocados.to_dict(orient="records"),
+    "df_consolidado": df_consolidado.to_dict(orient="records"), # <-- NOVA TABELA AQUI
+    "log_alocacao": logs
+}
+return output
