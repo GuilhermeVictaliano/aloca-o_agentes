@@ -1,0 +1,28 @@
+-- SQL de inserção com melhorias: inclui tempo_na_esteira, patch_entrada e patch_atual
+
+INSERT INTO alocacoes_consolidadas (
+      codigo_agente,
+      nome_agente,
+      cpf_tratado,
+      cards_ids_do_cpf,
+      score_precatorio,
+      oferta_maxima,
+      peso_ente,
+      peso_data,
+      tempo_na_esteira,
+      patch_entrada,
+      patch_atual
+    )
+    VALUES (
+      {{codigo_agente}},
+      {{nome_agente}},
+      {{cpf_tratado}},
+      {{cards_ids_do_cpf}},
+      {{score_precatorio}},
+      {{oferta_maxima}},
+      {{peso_ente}},
+      {{peso_data}},
+      {{tempo_na_esteira}},
+      {{patch_entrada}},
+      {{patch_atual}}
+    );
