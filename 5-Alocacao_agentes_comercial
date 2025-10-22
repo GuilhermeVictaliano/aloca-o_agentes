@@ -40,7 +40,8 @@ mapa_cpf_para_ids  = dict(Roteamento_dos_Grupos_Prontos.data.mapa_cpf_para_ids)
 # Garante que df_master tenha todas as colunas essenciais
 colunas_necessarias = [
     "cpf_tratado", "oferta_maxima",
-    "score_precatorio", "peso_ente", "peso_data"
+    "score_precatorio", "peso_ente", "peso_data","tempo_na_esteira", "patch_entrada", "patch_atual" 
+
 ]
 for col in colunas_necessarias:
     if col not in df_master.columns:
@@ -48,10 +49,10 @@ for col in colunas_necessarias:
         if col == "cpf_tratado":
             df_master[col] = ""
         else:
-            df_master[col] = 0
+            df_master[col] = np.nan
 
 # Converte os tipos adequados
-for c in ["score_precatorio", "oferta_maxima", "peso_ente", "peso_data"]:
+for c in ["score_precatorio", "oferta_maxima", "peso_ente", "peso_data", "tempo_na_esteira"]:
     df_master[c] = pd.to_numeric(df_master[c], errors="coerce").fillna(0)
 
 # Normaliza o CPF
@@ -170,6 +171,9 @@ def alocar(ag_row, cpf):
         "score_precatorio": m.get("score_precatorio", 0),
         "peso_ente": m.get("peso_ente", 0),
         "peso_data": m.get("peso_data", 0),
+        "tempo_na_esteira": m.get("tempo_na_esteira", 0),
+        "patch_entrada": m.get("patch_entrada", None),
+        "patch_atual": m.get("patch_atual", None),
         "cards_ids_do_cpf": todos_ids
     }
 
@@ -256,7 +260,10 @@ for cod, regs in tabelas_por_agente.items():
             "score_precatorio": r.get("score_precatorio", 0),
             "oferta_maxima": r.get("oferta_maxima", 0),
             "peso_ente": r.get("peso_ente", 0),
-            "peso_data": r.get("peso_data", 0)
+            "peso_data": r.get("peso_data", 0),
+            "tempo_na_esteira": r.get("tempo_na_esteira", 0),
+            "patch_entrada": r.get("patch_entrada"),
+            "patch_atual": r.get("patch_atual")
         })
 
 df_allocations_flat = pd.DataFrame(linhas)
@@ -294,8 +301,10 @@ if not df_allocations_flat.empty:
 colunas_comuns = [
     "codigo_agente", "nome_agente", "cpf_tratado",
     "cards_ids_do_cpf", "score_precatorio", "oferta_maxima",
-    "peso_ente", "peso_data"
+    "peso_ente", "peso_data",
+    "tempo_na_esteira", "patch_entrada", "patch_atual"
 ]
+
 
 # Prepara a tabela de alocados
 if not df_allocations_flat.empty:
@@ -314,6 +323,11 @@ if not df_nao_alocados.empty:
     if "cards_ids_do_cpf" not in df2.columns:
         # Recria a partir do mapa original para garantir a consistência
         df2["cards_ids_do_cpf"] = df2["cpf_tratado"].apply(lambda c: mapa_cpf_para_ids.get(str(c), []))
+      
+          # ✅ blindagem: garantir as colunas novas antes do reindex
+    for c in ["tempo_na_esteira", "patch_entrada", "patch_atual"]:
+        if c not in df2.columns:
+            df2[c] = np.nan
         
     df2 = df2[colunas_comuns]
 else:
@@ -339,7 +353,10 @@ except Exception:
     df_existentes_padronizado = pd.DataFrame(columns=df_consolidado.columns)
 
 # Garante mesmas colunas
-for c in ["codigo_agente","nome_agente","cpf_tratado","cards_ids_do_cpf","score_precatorio","oferta_maxima","peso_ente","peso_data"]:
+for c in ["codigo_agente","nome_agente","cpf_tratado",
+          "cards_ids_do_cpf","score_precatorio","oferta_maxima",
+          "peso_ente","peso_data",
+          "tempo_na_esteira","patch_entrada","patch_atual"]:
     if c not in df_existentes_padronizado.columns:
         df_existentes_padronizado[c] = np.nan
 
