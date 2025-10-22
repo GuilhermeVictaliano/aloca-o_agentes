@@ -157,7 +157,7 @@ df_pesos_cards = ensure_canonical_columns(df_pesos_cards, aliases)
 # =========================
 # 4) MERGE com sufixos + COALESCE
 # =========================
-right_cols_target = ["id","cpf_tratado","score_precatorio","peso_ente","peso_data","oferta_maxima"]
+right_cols_target = ["id","cpf_tratado","score_precatorio","peso_ente","peso_data","oferta_maxima","tempo_na_esteira"]
 for c in right_cols_target:
     if c not in df_pesos_cards.columns:
         df_pesos_cards[c] = np.nan
@@ -171,7 +171,7 @@ else:
     df_candidatos = pd.DataFrame(columns=right_cols_target)
 
 df_candidatos = ensure_cpf_tratado(df_candidatos)
-for col in ["cpf_tratado", "score_precatorio", "oferta_maxima", "peso_ente", "peso_data"]:
+for col in ["cpf_tratado", "score_precatorio", "oferta_maxima", "peso_ente", "peso_data","tempo_na_esteira"]:
     df_candidatos = coalesce_cols(df_candidatos, col, right_suf="_pesos", left_suf="_grp")
 
 # =========================
