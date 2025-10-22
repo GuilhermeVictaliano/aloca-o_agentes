@@ -155,6 +155,13 @@ else:
 # 0.2) Datas (gera criado_em_dt)
 df["criado_em_dt"] = pd.to_datetime(df.get("criado_em"), errors="coerce")
 
+
+# TESTE PACTHS E DATA ATUAL GH
+hoje = pd.Timestamp(datetime.now().date())
+df["tempo_na_esteira"] = (hoje - df["criado_em_dt"].dt.normalize()).dt.days
+df["tempo_na_esteira"] = df["tempo_na_esteira"].where(df["criado_em_dt"].notna(), 0)
+df["tempo_na_esteira"] = df["tempo_na_esteira"].astype(float)
+
 # 0.3) CPF tratado (gera se não existir)
 if "cpf_tratado" not in df.columns:
     src = None
@@ -345,7 +352,7 @@ df_grupos_pendentes = df_unassigned[
 # ============================================================
 # PARTE 3 — df_pesos_cards (somente prontos, oferta > 0)
 # ============================================================
-cols = ["id", "cpf_tratado", "oferta_maxima", "peso_ente", "peso_data", "score_precatorio"]
+cols = ["id", "cpf_tratado", "oferta_maxima", "peso_ente", "peso_data", "score_precatorio", "tempo_na_esteira"]
 for c in cols:
     if c not in df_grupos_prontos.columns:
         df_grupos_prontos[c] = None  # None para ser JSON-safe
