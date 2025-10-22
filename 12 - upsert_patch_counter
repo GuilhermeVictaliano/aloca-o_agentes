@@ -1,0 +1,6 @@
+INSERT INTO patch_counter (cpf_tratado, patch_number)
+SELECT
+  (d->>'cpf_tratado')::text    AS cpf_tratado,
+  (d->>'patch_entrada')::int   AS patch_number
+FROM jsonb_array_elements({{ Alocacao_agentes_comercial.data.df_consolidado | toJSON }}::jsonb) AS d
+ON CONFLICT (cpf_tratado) DO NOTHING;
