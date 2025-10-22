@@ -1,0 +1,400 @@
+# ==============================================================
+# Alocacao_agentes_comercial — REV FINAL (criado_em + patch_counter) — FIX v2
+# ==============================================================
+
+import pandas as pd
+import numpy as np
+from math import inf
+
+# -----------------------------
+# 1) ENTRADAS
+# -----------------------------
+df_master = pd.DataFrame(Roteamento_dos_Grupos_Prontos.data.df_candidates_scored_master).copy()
+df_cap    = pd.DataFrame(Roteamento_dos_Grupos_Prontos.data.df_agentes_capacidade).copy()
+tabelas_por_agente = dict(Roteamento_dos_Grupos_Prontos.data.tabelas_por_agente)
+mapa_agente        = dict(Roteamento_dos_Grupos_Prontos.data.mapa_agente)
+mapa_cpf_para_ids  = dict(Roteamento_dos_Grupos_Prontos.data.mapa_cpf_para_ids)
+
+df_exist = pd.DataFrame(
+    getattr(Roteamento_dos_Grupos_Prontos, "data", Roteamento_dos_Grupos_Prontos).get("df_existentes_padronizado", [])
+)
+
+# SELECT simples (já existente no app) que retorna pelo menos [cpf_tratado, patch_number]
+df_patch_counter = pd.DataFrame(select_patch_counter.data or [])
+
+# -----------------------------
+# 2) SANIDADE / COLUNAS
+# -----------------------------
+cols_need = [
+    "cpf_tratado","oferta_maxima","score_precatorio","peso_ente","peso_data",
+    "tempo_na_esteira","patch_entrada","patch_atual","criado_em"
+]
+for c in cols_need:
+    if c not in df_master.columns:
+        df_master[c] = np.nan
+
+# CPF normalizado
+df_master["cpf_tratado"] = (
+    df_master["cpf_tratado"].astype(str)
+    .str.replace(".","",regex=False)
+    .str.replace("-","",regex=False)
+    .str.strip()
+)
+
+# Numéricos base
+for c in ["score_precatorio","oferta_maxima","peso_ente","peso_data",
+          "tempo_na_esteira","patch_entrada","patch_atual"]:
+    df_master[c] = pd.to_numeric(df_master[c], errors="coerce")
+
+# --------- BLINDAGEM COMPLETA DE df_exist (evita KeyError em seleções posteriores)
+cols_all_exist = [
+    "codigo_agente","nome_agente","cpf_tratado",
+    "cards_ids_do_cpf","score_precatorio","oferta_maxima",
+    "peso_ente","peso_data","tempo_na_esteira",
+    "patch_entrada","patch_atual"
+]
+if df_exist is None or not isinstance(df_exist, pd.DataFrame):
+    df_exist = pd.DataFrame(columns=cols_all_exist)
+
+for c in cols_all_exist:
+    if c not in df_exist.columns:
+        if c == "cards_ids_do_cpf":
+            df_exist[c] = [[] for _ in range(len(df_exist))]
+        else:
+            df_exist[c] = np.nan
+
+for c in ["score_precatorio","oferta_maxima","peso_ente","peso_data",
+          "tempo_na_esteira","patch_entrada","patch_atual"]:
+    df_exist[c] = pd.to_numeric(df_exist[c], errors="coerce")
+
+# -----------------------------
+# 3) NOVO PATCH DO DIA
+# -----------------------------
+def extrair_novo_patch():
+    # 1) se houve insert_new_patch nesta execução
+    try:
+        if 'insert_new_patch' in globals():
+            row0 = (insert_new_patch.data or [None])[0]
+            if isinstance(row0, dict):
+                cand = row0.get("patch_number") or row0.get("patch_atual") or row0.get("patch") or row0.get("novo_patch")
+                if cand is not None:
+                    return int(cand)
+    except:
+        pass
+    # 2) caso contrário, faz (max já visto) + 1, olhando exist + patch_counter
+    try:
+        series = []
+        if not df_exist.empty:
+            series += [df_exist["patch_atual"], df_exist["patch_entrada"]]
+        if not df_patch_counter.empty and "patch_number" in df_patch_counter.columns:
+            series += [pd.to_numeric(df_patch_counter["patch_number"], errors="coerce")]
+        if series:
+            v = pd.concat(series, axis=0)
+            mx = pd.to_numeric(v, errors="coerce").max()
+            if pd.notna(mx):
+                return int(mx) + 1
+    except:
+        pass
+    # 3) fallback
+    return 1
+
+novo_patch = extrair_novo_patch()
+df_master["patch_atual"] = novo_patch
+
+# -----------------------------
+# 4) patch_entrada (prioridade)
+#    1) patch_counter.patch_number
+#    2) histórico consolidado (min patch conhecido por CPF)
+#    3) valor do master (se vier)
+#    4) novo_patch
+# -----------------------------
+# (2) mínimo do histórico
+if not df_exist.empty:
+    tmp = df_exist[["cpf_tratado","patch_entrada","patch_atual"]].copy()
+    tmp["patch_entrada_eff"] = tmp["patch_entrada"]
+    m = tmp["patch_entrada_eff"].isna()
+    tmp.loc[m, "patch_entrada_eff"] = tmp.loc[m, "patch_atual"]
+    df_min_from_exist = (
+        tmp.dropna(subset=["cpf_tratado"])
+           .groupby("cpf_tratado", as_index=True)["patch_entrada_eff"]
+           .min()
+           .rename("patch_entrada_from_exist")
+           .to_frame()
+    )
+else:
+    df_min_from_exist = pd.DataFrame(columns=["patch_entrada_from_exist"])
+
+# (1) patch_counter
+if not df_patch_counter.empty:
+    df_pc = df_patch_counter.rename(columns={"patch_number":"patch_entrada_counter"})
+    df_pc = df_pc[["cpf_tratado","patch_entrada_counter"]].dropna().drop_duplicates()
+    df_pc["patch_entrada_counter"] = pd.to_numeric(df_pc["patch_entrada_counter"], errors="coerce")
+    df_pc = df_pc.set_index("cpf_tratado")
+else:
+    df_pc = pd.DataFrame(columns=["patch_entrada_counter"])
+
+# merge nas bases auxiliares
+df_master = df_master.merge(df_min_from_exist, how="left", left_on="cpf_tratado", right_index=True)
+df_master = df_master.merge(df_pc,              how="left", left_on="cpf_tratado", right_index=True)
+
+# monta patch_entrada com a prioridade
+patch1 = pd.to_numeric(df_master["patch_entrada_counter"],     errors="coerce")  # (1)
+patch2 = pd.to_numeric(df_master["patch_entrada_from_exist"],  errors="coerce")  # (2)
+patch3 = pd.to_numeric(df_master["patch_entrada"],             errors="coerce")  # (3)
+
+df_master["patch_entrada"] = (
+    patch1.where(patch1.notna(), patch2)
+          .where(lambda s: s.notna(), patch3)
+          .where(lambda s: s.notna(), novo_patch)
+).astype(int)
+
+# -----------------------------
+# 5) tempo_na_esteira = DIAS(criado_em -> hoje)
+# -----------------------------
+# se seu campo no SELECT tiver outro nome (ex: created_at), troque aqui:
+cr_raw = df_master["criado_em"]
+
+cr = pd.to_datetime(cr_raw, errors="coerce", utc=True)
+if cr.isna().mean() > 0.8:
+    # talvez timestamps locais sem TZ
+    cr = pd.to_datetime(cr_raw, errors="coerce")
+    try:
+        cr = cr.dt.tz_localize("America/Sao_Paulo", nonexistent="shift_forward", ambiguous="NaT")
+    except Exception:
+        cr = pd.to_datetime(cr_raw, errors="coerce", utc=True)
+
+try:
+    cr = cr.dt.tz_convert("America/Sao_Paulo")
+except Exception:
+    pass
+
+hoje = pd.Timestamp.now(tz="America/Sao_Paulo").normalize()
+dias = (hoje - cr.dt.normalize()).dt.days
+
+# Preenche tempo_na_esteira com DIAS; se faltar data, usa diferença de patches (piso 0)
+df_master["tempo_na_esteira"] = pd.to_numeric(df_master["tempo_na_esteira"], errors="coerce")
+df_master["tempo_na_esteira"] = df_master["tempo_na_esteira"].where(
+    df_master["tempo_na_esteira"].notna(), dias
+)
+mask_sem_data = df_master["tempo_na_esteira"].isna()
+df_master.loc[mask_sem_data, "tempo_na_esteira"] = (
+    (pd.to_numeric(df_master.loc[mask_sem_data,"patch_atual"], errors="coerce")
+   - pd.to_numeric(df_master.loc[mask_sem_data,"patch_entrada"], errors="coerce")).clip(lower=0)
+)
+df_master["tempo_na_esteira"] = pd.to_numeric(df_master["tempo_na_esteira"], errors="coerce").fillna(0)
+
+# -----------------------------
+# 6) SANIDADE df_cap
+# -----------------------------
+for c in ["ID","codigo_agente","nome_agente","disponivel","limite_min_score","limite_max_score","capacidade_restante"]:
+    if c not in df_cap.columns: df_cap[c] = np.nan
+for c in ["limite_min_score","limite_max_score","capacidade_restante"]:
+    df_cap[c] = pd.to_numeric(df_cap[c], errors="coerce").fillna(0)
+
+def to_code_str(v):
+    try: return str(int(v))
+    except: return None
+
+df_cap["codigo_key"] = df_cap.apply(lambda r: to_code_str(r.get("codigo_agente", r.get("ID"))), axis=1)
+df_agentes_ativos = df_cap[
+    (df_cap["disponivel"]==1) & (df_cap["capacidade_restante"]>0) & (df_cap["codigo_key"].notna())
+].copy()
+
+if df_agentes_ativos.empty:
+    base_cols = ["codigo_agente","nome_agente","cpf_tratado","cards_ids_do_cpf","score_precatorio","oferta_maxima",
+                 "peso_ente","peso_data","tempo_na_esteira","patch_entrada","patch_atual"]
+    if "cards_ids_do_cpf" not in df_master.columns:
+        df_master["cards_ids_do_cpf"] = df_master["cpf_tratado"].apply(lambda c: mapa_cpf_para_ids.get(str(c), []))
+    df_master["codigo_agente"] = "Não Alocado"; df_master["nome_agente"] = "Não Alocado"
+    df_consolidado = df_master[base_cols].copy().sort_values("score_precatorio", ascending=False).reset_index(drop=True)
+    base_exist = df_exist[base_cols].copy() if not df_exist.empty else pd.DataFrame(columns=base_cols)
+    output = {
+        "tabelas_por_agente": tabelas_por_agente,
+        "df_allocations_flat": [],
+        "df_nao_alocados": df_master.to_dict(orient="records"),
+        "df_consolidado": df_consolidado.to_dict(orient="records"),
+        "df_consolidado_total": pd.concat([base_exist, df_consolidado], ignore_index=True).to_dict(orient="records"),
+        "log_alocacao": ["Nenhum agente disponível com capacidade."]
+    }
+    return output
+
+df_agentes_ativos.sort_values(by=["limite_max_score","limite_min_score"], ascending=[False,False], inplace=True, ignore_index=True)
+
+# -----------------------------
+# 7) ALOCAÇÃO
+# -----------------------------
+df_master = df_master.sort_values(by="score_precatorio", ascending=False).reset_index(drop=True)
+cpfs = df_master["cpf_tratado"].astype(str).tolist()
+score_por_cpf  = {str(r["cpf_tratado"]): float(r["score_precatorio"]) for _, r in df_master.iterrows()}
+master_por_cpf = {str(r["cpf_tratado"]): r for _, r in df_master.iterrows()}
+cpf_alocado_em = {}
+cap_rest = {row["codigo_key"]: int(row["capacidade_restante"]) for _, row in df_agentes_ativos.iterrows()}
+
+def dentro_intervalo(ag_row, score):
+    min_s = float(ag_row.get("limite_min_score", 0) or 0)
+    max_s = float(ag_row.get("limite_max_score", 0) or 0)
+    if max_s <= 0: max_s = float("inf")
+    return (score >= min_s) and (score <= max_s)
+
+def elegivel(ag_row, cpf):
+    cod = ag_row["codigo_key"]
+    if cap_rest.get(cod,0) <= 0: return False
+    score = score_por_cpf.get(str(cpf), 0.0)
+    return dentro_intervalo(ag_row, score)
+
+def alocar(ag_row, cpf):
+    cod = ag_row["codigo_key"]
+    if str(cpf) in cpf_alocado_em: return False
+    if cap_rest.get(cod,0) <= 0: return False
+
+    m = master_por_cpf[str(cpf)]
+    registro = {
+        "id": m.get("id"),
+        "cpf_tratado": str(cpf),
+        "oferta_maxima": m.get("oferta_maxima", 0),
+        "score_precatorio": m.get("score_precatorio", 0),
+        "peso_ente": m.get("peso_ente", 0),
+        "peso_data": m.get("peso_data", 0),
+        "tempo_na_esteira": pd.to_numeric(m.get("tempo_na_esteira", 0), errors="coerce"),
+        "patch_entrada": int(pd.to_numeric(m.get("patch_entrada"), errors="coerce")),
+        "patch_atual":   int(pd.to_numeric(m.get("patch_atual"),   errors="coerce")),
+        "cards_ids_do_cpf": mapa_cpf_para_ids.get(str(cpf), [])
+    }
+    if cod not in tabelas_por_agente: tabelas_por_agente[cod] = []
+    tabelas_por_agente[cod].append(registro)
+    cpf_alocado_em[str(cpf)] = cod
+    cap_rest[cod] = cap_rest.get(cod,0) - 1
+    return True
+
+# faixa primária
+ag = df_agentes_ativos.reset_index(drop=True)
+def prox_max(i):
+    if i+1 < len(ag): return float(ag.loc[i+1,"limite_max_score"] or 0)
+    return -inf
+
+for i in range(len(ag)):
+    row = ag.loc[i]; cod = row["codigo_key"]
+    if cap_rest.get(cod,0) <= 0: continue
+    max_i = float(row.get("limite_max_score",0) or 0) or float("inf")
+    min_i = float(row.get("limite_min_score",0) or 0)
+    lim = prox_max(i); lim = lim if lim>0 else -inf
+    for cpf in cpfs:
+        if cap_rest.get(cod,0) <= 0: break
+        if cpf in cpf_alocado_em: continue
+        sc = score_por_cpf.get(cpf,0.0)
+        if sc > lim and sc <= max_i and sc >= min_i:
+            alocar(row, cpf)
+
+# interleaving
+if sum(max(0,v) for v in cap_rest.values()) > 0:
+    mudou = True; guard = 0
+    while mudou and guard < 100000:
+        mudou = False; guard += 1
+        for i in range(len(ag)):
+            row = ag.loc[i]; cod = row["codigo_key"]
+            if cap_rest.get(cod,0) <= 0: continue
+            for cpf in cpfs:
+                if cpf in cpf_alocado_em: continue
+                if elegivel(row, cpf):
+                    if alocar(row, cpf): mudou = True
+                    break
+        if not mudou: break
+
+# -----------------------------
+# 8) RESULTADOS
+# -----------------------------
+linhas = []
+for cod, regs in tabelas_por_agente.items():
+    for r in regs:
+        tcalc = pd.to_numeric(r.get("tempo_na_esteira", np.nan), errors="coerce")
+        if pd.isna(tcalc):
+            pa = int(pd.to_numeric(r.get("patch_atual", novo_patch), errors="coerce"))
+            pe = int(pd.to_numeric(r.get("patch_entrada", pa),      errors="coerce"))
+            tcalc = max(0, pa-pe)
+        linhas.append({
+            "codigo_agente": cod,
+            "nome_agente": mapa_agente.get(cod, ""),
+            "cpf_tratado": r.get("cpf_tratado"),
+            "master_card_id": r.get("id"),
+            "cards_ids_do_cpf": r.get("cards_ids_do_cpf", []),
+            "score_precatorio": r.get("score_precatorio", 0),
+            "oferta_maxima": r.get("oferta_maxima", 0),
+            "peso_ente": r.get("peso_ente", 0),
+            "peso_data": r.get("peso_data", 0),
+            "tempo_na_esteira": tcalc,
+            "patch_entrada": int(pd.to_numeric(r.get("patch_entrada", novo_patch), errors="coerce")),
+            "patch_atual":   int(pd.to_numeric(r.get("patch_atual",   novo_patch), errors="coerce"))
+        })
+df_alloc = pd.DataFrame(linhas)
+
+# não alocados
+cpfs_alocados = set(cpf_alocado_em.keys())
+df_nao = df_master[~df_master["cpf_tratado"].astype(str).isin(cpfs_alocados)].copy()
+
+# logs
+logs = []
+logs.append(f"Agentes ativos com capacidade: {len(df_agentes_ativos)}")
+logs.append(f"CPFs candidatos (master): {len(df_master)}")
+logs.append(f"CPFs alocados: {len(cpfs_alocados)}")
+if not df_alloc.empty:
+    res = (df_alloc.groupby(["codigo_agente","nome_agente"])["cpf_tratado"]
+           .nunique().reset_index().rename(columns={"cpf_tratado":"cpfs_alocados"}))
+    for _, row in res.iterrows():
+        logs.append(f"  - {row['nome_agente']} ({row['codigo_agente']}): {row['cpfs_alocados']} CPFs")
+
+# consolidado
+cols = ["codigo_agente","nome_agente","cpf_tratado","cards_ids_do_cpf","score_precatorio","oferta_maxima",
+        "peso_ente","peso_data","tempo_na_esteira","patch_entrada","patch_atual"]
+df1 = df_alloc[cols].copy() if not df_alloc.empty else pd.DataFrame(columns=cols)
+
+if not df_nao.empty:
+    df2 = df_nao.copy()
+    df2["codigo_agente"] = "Não Alocado"; df2["nome_agente"] = "Não Alocado"
+    if "cards_ids_do_cpf" not in df2.columns:
+        df2["cards_ids_do_cpf"] = df2["cpf_tratado"].apply(lambda c: mapa_cpf_para_ids.get(str(c), []))
+    # blindagem extra para evitar KeyError se a coluna não existir
+    if "tempo_na_esteira" not in df2.columns:
+        df2["tempo_na_esteira"] = np.nan
+
+    df2["patch_atual"]   = pd.to_numeric(df2["patch_atual"], errors="coerce").fillna(novo_patch).astype(int)
+    df2["patch_entrada"] = pd.to_numeric(df2["patch_entrada"], errors="coerce").fillna(df2["patch_atual"]).astype(int)
+    df2["tempo_na_esteira"] = pd.to_numeric(df2["tempo_na_esteira"], errors="coerce").fillna(
+        (df2["patch_atual"] - df2["patch_entrada"]).clip(lower=0)
+    )
+    df2 = df2[cols]
+else:
+    df2 = pd.DataFrame(columns=cols)
+
+df_consolidado = pd.concat([df1, df2], ignore_index=True)
+for c in ["tempo_na_esteira","patch_atual","patch_entrada"]:
+    df_consolidado[c] = pd.to_numeric(df_consolidado[c], errors="coerce")
+df_consolidado["tempo_na_esteira"] = df_consolidado["tempo_na_esteira"].fillna(0)
+df_consolidado["patch_atual"]   = df_consolidado["patch_atual"].fillna(novo_patch).astype(int)
+df_consolidado["patch_entrada"] = df_consolidado["patch_entrada"].fillna(df_consolidado["patch_atual"]).astype(int)
+df_consolidado = df_consolidado.sort_values(by="score_precatorio", ascending=False).reset_index(drop=True)
+
+# consolidado total
+if not df_exist.empty:
+    base_exist = df_exist[cols].copy()
+    for c in ["tempo_na_esteira","patch_atual","patch_entrada"]:
+        base_exist[c] = pd.to_numeric(base_exist[c], errors="coerce")
+    base_exist["tempo_na_esteira"] = base_exist["tempo_na_esteira"].fillna(
+        (base_exist["patch_atual"] - base_exist["patch_entrada"]).clip(lower=0)
+    )
+else:
+    base_exist = pd.DataFrame(columns=cols)
+
+df_total = pd.concat([base_exist, df_consolidado], ignore_index=True)
+df_total["tempo_na_esteira"] = pd.to_numeric(df_total["tempo_na_esteira"], errors="coerce").fillna(0)
+df_total["patch_atual"]   = pd.to_numeric(df_total["patch_atual"], errors="coerce").fillna(novo_patch).astype(int)
+df_total["patch_entrada"] = pd.to_numeric(df_total["patch_entrada"], errors="coerce").fillna(df_total["patch_atual"]).astype(int)
+
+output = {
+    "df_consolidado_total": df_total.to_dict(orient="records"),
+    "tabelas_por_agente": tabelas_por_agente,
+    "df_allocations_flat": df_consolidado[df_consolidado["codigo_agente"]!="Não Alocado"].to_dict(orient="records"),
+    "df_nao_alocados": df_consolidado[df_consolidado["codigo_agente"]=="Não Alocado"].to_dict(orient="records"),
+    "df_consolidado": df_consolidado.to_dict(orient="records"),
+    "log_alocacao": logs
+}
+return output
