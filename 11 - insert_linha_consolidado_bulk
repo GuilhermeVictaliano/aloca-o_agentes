@@ -1,0 +1,37 @@
+WITH incoming AS (
+  SELECT
+    (d->>'cpf_tratado')::text                     AS cpf_tratado,
+    NULLIF(d->>'codigo_agente','')::text          AS codigo_agente,
+    NULLIF(d->>'nome_agente','')::text            AS nome_agente,
+    (d->>'score_precatorio')::numeric             AS score_precatorio,
+    (d->>'oferta_maxima')::numeric                AS oferta_maxima,
+    (d->>'peso_ente')::numeric                    AS peso_ente,
+    (d->>'peso_data')::numeric                    AS peso_data,
+    (d->>'tempo_na_esteira')::int                 AS tempo_na_esteira,
+    (d->>'patch_atual')::int                      AS patch_atual,
+    (d->>'patch_entrada')::int                    AS patch_entrada_new,
+    COALESCE(NULLIF(d->>'cards_ids_do_cpf',''),'[]')::jsonb AS cards_ids_do_cpf
+  FROM jsonb_array_elements({{ Alocacao_agentes_comercial.data.df_consolidado | toJSON }}::jsonb) AS d
+)
+INSERT INTO alocacoes_consolidadas (
+  cpf_tratado, codigo_agente, nome_agente,
+  score_precatorio, oferta_maxima, peso_ente, peso_data,
+  tempo_na_esteira, patch_atual, patch_entrada, cards_ids_do_cpf
+)
+SELECT
+  i.cpf_tratado, i.codigo_agente, i.nome_agente,
+  i.score_precatorio, i.oferta_maxima, i.peso_ente, i.peso_data,
+  i.tempo_na_esteira, i.patch_atual, i.patch_entrada_new, i.cards_ids_do_cpf
+FROM incoming i
+ON CONFLICT (cpf_tratado)
+DO UPDATE SET
+  codigo_agente    = EXCLUDED.codigo_agente,
+  nome_agente      = EXCLUDED.nome_agente,
+  score_precatorio = EXCLUDED.score_precatorio,
+  oferta_maxima    = EXCLUDED.oferta_maxima,
+  peso_ente        = EXCLUDED.peso_ente,
+  peso_data        = EXCLUDED.peso_data,
+  tempo_na_esteira = EXCLUDED.tempo_na_esteira,
+  patch_atual      = EXCLUDED.patch_atual,
+  cards_ids_do_cpf = EXCLUDED.cards_ids_do_cpf,
+  patch_entrada    = COALESCE(alocacoes_consolidadas.patch_entrada, EXCLUDED.patch_entrada);
