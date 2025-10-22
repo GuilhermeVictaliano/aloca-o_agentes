@@ -1,0 +1,8 @@
+-- Insere e devolve um novo patch_number automaticamente (último + 1)
+WITH novo AS (
+  SELECT COALESCE(MAX(patch_number), 0) + 1 AS patch_number
+  FROM patch_counter
+)
+INSERT INTO patch_counter (patch_number, created_at)
+SELECT patch_number, NOW() FROM novo
+RETURNING patch_number;
