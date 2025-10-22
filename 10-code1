@@ -1,0 +1,75 @@
+return (function () {
+  // ---------- helpers ----------
+  function toIntOrNull(v) {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.trunc(n) : null;
+  }
+  function toNumOrNull(v) {
+    if (v === null || v === undefined || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  function toArray(v) {
+    if (Array.isArray(v)) return v;
+    if (v === null || v === undefined || v === "") return [];
+    return [v];
+  }
+
+  // ---------- origem dos dados ----------
+  const srcRaw =
+    (Alocacao_agentes_comercial?.data?.df_consolidado_total &&
+      Array.isArray(Alocacao_agentes_comercial.data.df_consolidado_total) &&
+      Alocacao_agentes_comercial.data.df_consolidado_total) ||
+    (Alocacao_agentes_comercial?.data?.df_consolidado &&
+      Array.isArray(Alocacao_agentes_comercial.data.df_consolidado) &&
+      Alocacao_agentes_comercial.data.df_consolidado) ||
+    [];
+
+  const dados = [...srcRaw].sort(
+    (a, b) => (Number(b?.score_precatorio) || 0) - (Number(a?.score_precatorio) || 0)
+  );
+
+  // ---------- normalização linha a linha ----------
+  const rows = dados.map((r) => {
+    const patch_entrada = toIntOrNull(r?.patch_entrada);
+    const patch_atual   = toIntOrNull(r?.patch_atual);
+
+    // tempo_na_esteira: se vier vazio/0, tenta calcular por diferença
+    let tempo_na_esteira = toIntOrNull(r?.tempo_na_esteira);
+    if (!Number.isFinite(tempo_na_esteira) || tempo_na_esteira === null || tempo_na_esteira <= 0) {
+      if (patch_entrada !== null && patch_atual !== null) {
+        tempo_na_esteira = Math.max(0, patch_atual - patch_entrada);
+      } else {
+        tempo_na_esteira = null;
+      }
+    }
+
+    // codigo_agente "Não Alocado" => null
+    let codigo_agente = r?.codigo_agente;
+    if (String(codigo_agente).trim().toLowerCase() === "não alocado") {
+      codigo_agente = null;
+    } else {
+      codigo_agente = toIntOrNull(codigo_agente);
+    }
+
+    return {
+      codigo_agente,
+      nome_agente: String(r?.nome_agente ?? "Não Alocado"),
+      cpf_tratado: String(r?.cpf_tratado ?? "").trim(),
+      cards_ids_do_cpf: toArray(r?.cards_ids_do_cpf),
+
+      score_precatorio: toNumOrNull(r?.score_precatorio),
+      oferta_maxima:    toNumOrNull(r?.oferta_maxima),
+      peso_ente:        toNumOrNull(r?.peso_ente),
+      peso_data:        toNumOrNull(r?.peso_data),
+
+      tempo_na_esteira,
+      patch_entrada,
+      patch_atual,
+    };
+  });
+
+  // ---------- retorno OBRIGATÓRIO ----------
+  return { total: rows.length, rows };
+})();
